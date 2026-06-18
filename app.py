@@ -1,119 +1,315 @@
-from flask import Flask, render_template, request, send_file
 import os
+import re
+import json
+import time
+import shutil
+import zipfile
+import tempfile
+
 import cv2
 import numpy as np
 import fitz
-from PyPDF2 import PdfReader, PdfWriter
-from io import BytesIO
 from fpdf import FPDF
 from PIL import Image
-import tempfile
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
+from flask import (Flask, render_template, request, send_file, jsonify, abort,
+                   after_this_request)
+
+# --- 配置 ---
+UPLOAD_DIR = "uploads"          # 用户上传的原始 PDF（按会话隔离）
+IMG_DIR = "output_images"       # PDF 转图片的中间产物（按会话+文件隔离）
+OUT_DIR = "outputs"             # 去水印后生成的 PDF（按会话隔离）
+ALLOWED_EXT = {".pdf"}
+MAX_FILE_MB = 200
+SESSION_MAX_AGE_HOURS = 24      # 启动时清理超过此时长的孤儿会话目录
 CONVERT_DPI = 300
+
+A4_SIZE_PX_72DPI = (595, 842)   # A4 在 72dpi 下的像素尺寸
+
+# session_id / file_id 只允许这些字符，防止路径穿越
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 app = Flask(__name__)
 
 
-# 图像去除水印函数
+def safe_id(value):
+    """校验会话/文件 id，合法返回原值，否则 None。"""
+    if not value or not isinstance(value, str):
+        return None
+    return value if _ID_RE.match(value) else None
+
+
 def remove_watermark(image_path):
-    img = cv2.imread(image_path)
-    lower_hsv = np.array([160, 160, 160])
-    upper_hsv = np.array([255, 255, 255])
-    mask = cv2.inRange(img, lower_hsv, upper_hsv)
-    mask = cv2.GaussianBlur(mask, (1, 1), 0)
-    img[mask == 255] = [255, 255, 255]
-    cv2.imwrite(image_path, img)
+    """就地去除单张图片的水印（针对灰/暗色水印）。单页异常不中断整批。"""
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return
+        lower = np.array([160, 160, 160])
+        upper = np.array([255, 255, 255])
+        mask = cv2.inRange(img, lower, upper)
+        mask = cv2.GaussianBlur(mask, (1, 1), 0)
+        img[mask == 255] = [255, 255, 255]
+        cv2.imwrite(image_path, img)
+    except Exception as exc:  # noqa: BLE001 - 单页失败不应中断整批
+        print(f"[warn] 去水印失败 {image_path}: {exc}")
 
-
-# 将PDF转换为图片，并保存到指定目录
 
 def pdf_to_images(pdf_path, output_folder):
+    """把 PDF 每页渲染成 PNG 并去水印，返回图片路径列表。"""
+    os.makedirs(output_folder, exist_ok=True)
     images = []
     doc = fitz.open(pdf_path)
-    dpi = CONVERT_DPI / 72  # 使用全局DPI设置
-    for page_num in range(doc.page_count):
-        page = doc[page_num]
-        # 设置分辨率为300 DPI
-        pix = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72))
-        image_path = os.path.join(output_folder, f"page_{page_num + 1}.png")
-        pix.save(image_path)
-        images.append(image_path)
-        # 去除每张图片的水印
-        remove_watermark(image_path)
+    try:
+        for page_num in range(doc.page_count):
+            page = doc[page_num]
+            pix = page.get_pixmap(matrix=fitz.Matrix(CONVERT_DPI / 72, CONVERT_DPI / 72))
+            image_path = os.path.join(output_folder, f"page_{page_num + 1}.png")
+            pix.save(image_path)
+            images.append(image_path)
+            remove_watermark(image_path)
+    finally:
+        doc.close()
     return images
 
 
-# 将图片合并为PDF
-
-# 定义A4纸张在72dpi下的像素尺寸（宽度和高度）
-A4_SIZE_PX_72DPI = (595, 842)
-
-
 def images_to_pdf(image_paths, output_path):
-    pdf_writer = FPDF(unit='pt', format='A4')
-
+    """把图片合并为 A4 PDF。直接喂 PIL Image 给 fpdf2，不再落临时文件。"""
+    pdf = FPDF(unit="pt", format="A4")
     for image_path in image_paths:
         with Image.open(image_path) as img:
-            width, height = img.size
-
-            # 计算实际DPI（假设从pdf转图片时已设置为300 DPI）
-            dpi = 300
-            ratio = min(A4_SIZE_PX_72DPI[0] / width, A4_SIZE_PX_72DPI[1] / height)
-
-            # 缩放图像以适应A4纸张，并保持长宽比
-            img_resized = img.resize((int(width * ratio), int(height * ratio)))
-
-            # 创建临时文件并写入图片数据
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                img_resized.save(temp_file.name, format='PNG')
-
-            # 添加一页
-            pdf_writer.add_page()
-
-            # 使用临时文件路径添加图像到PDF
-            pdf_writer.image(temp_file.name, x=0, y=0, w=A4_SIZE_PX_72DPI[0], h=A4_SIZE_PX_72DPI[1])
-
-    # 清理临时文件
-    for image_path in image_paths:
-        _, temp_filename = os.path.split(image_path)
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-    pdf_writer.output(output_path)
+            pdf.add_page()
+            # fpdf2 同时给 w 和 h 会把图片铺满整页，无需预缩放
+            # （预缩放比例会被二次拉伸抵消，反而引入 int 截断失真）
+            pdf.image(img, x=0, y=0, w=A4_SIZE_PX_72DPI[0], h=A4_SIZE_PX_72DPI[1])
+    pdf.output(output_path)
 
 
+def process_one(session_id, file_id):
+    """处理单个已上传文件：转图 → 去水印 → 合回 PDF，返回结果字典。"""
+    pdf_path = os.path.join(UPLOAD_DIR, session_id, f"{file_id}.pdf")
+    img_folder = os.path.join(IMG_DIR, session_id, file_id)
+    out_path = os.path.join(OUT_DIR, session_id, f"{file_id}.pdf")
 
-@app.route('/')
+    if not os.path.exists(pdf_path):
+        return {"id": file_id, "pages": 0, "status": "missing"}
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        images = pdf_to_images(pdf_path, img_folder)
+        images_to_pdf(images, out_path)
+        return {"id": file_id, "pages": len(images), "status": "done"}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] 处理失败 {file_id}: {exc}")
+        return {"id": file_id, "pages": 0, "status": "error", "error": str(exc)}
+    finally:
+        # 中间图片是大头（约 1MB/页），处理完立刻回收
+        shutil.rmtree(img_folder, ignore_errors=True)
+
+
+def zip_session(session_id):
+    """把某会话下所有成品 PDF 流式打包到临时 zip 文件，返回路径。同名文件自动去重。"""
+    out_folder = os.path.join(OUT_DIR, session_id)
+    fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="pwr_")
+    os.close(fd)
+    used_names = {}
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in sorted(os.listdir(out_folder)):
+                if not name.endswith(".pdf"):
+                    continue
+                arc = _read_meta(out_folder, name)  # 已含 basename 清洗与兜底
+                base, ext = os.path.splitext(arc)
+                candidate = arc
+                i = 1
+                while candidate.lower() in used_names:
+                    candidate = f"{base} ({i}){ext}"
+                    i += 1
+                used_names[candidate.lower()] = True
+                zf.write(os.path.join(out_folder, name), arcname=candidate)
+    except Exception:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
+    return zip_path
+
+
+def cleanup_session(session_id):
+    """删除某会话在三个根目录下的全部文件。"""
+    if not safe_id(session_id):
+        return
+    for base in (UPLOAD_DIR, IMG_DIR, OUT_DIR):
+        shutil.rmtree(os.path.join(base, session_id), ignore_errors=True)
+
+
+def startup_cleanup():
+    """启动时清理超过 SESSION_MAX_AGE_HOURS 的孤儿会话目录。"""
+    cutoff = time.time() - SESSION_MAX_AGE_HOURS * 3600
+    for base in (UPLOAD_DIR, IMG_DIR, OUT_DIR):
+        if not os.path.isdir(base):
+            continue
+        for name in os.listdir(base):
+            path = os.path.join(base, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
+
+
+startup_cleanup()
+
+
+@app.route("/")
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.route('/upload', methods=['POST'])
+@app.route("/upload", methods=["POST"])
 def upload():
-    uploaded_file = request.files['file']
-    if uploaded_file.filename != '':
-        pdf_path = 'uploads/uploaded_file.pdf'
-        uploaded_file.save(pdf_path)
-        return render_template('index.html', message='文件上传成功')
+    session_id = safe_id(request.form.get("session_id", ""))
+    if not session_id:
+        return jsonify({"error": "无效的 session_id"}), 400
+
+    files = request.files.getlist("file")
+    if not files:
+        return jsonify({"error": "未收到文件"}), 400
+
+    upload_dir = os.path.join(UPLOAD_DIR, session_id)
+    os.makedirs(upload_dir, exist_ok=True)
+
+    manifest = []
+    for f in files:
+        original = f.filename or ""
+        ext = os.path.splitext(original)[1].lower()
+        if ext not in ALLOWED_EXT:
+            manifest.append({"name": original, "size": 0, "status": "rejected"})
+            continue
+
+        # 读取并校验大小
+        f.stream.seek(0, 2)
+        size = f.stream.tell()
+        f.stream.seek(0)
+        if size > MAX_FILE_MB * 1024 * 1024:
+            manifest.append({"name": original, "size": size, "status": "too_large"})
+            continue
+
+        file_id = os.urandom(8).hex()
+        save_path = os.path.join(upload_dir, f"{file_id}.pdf")
+        try:
+            f.save(save_path)
+            manifest.append({
+                "id": file_id,
+                "name": original,
+                "size": size,
+                "status": "uploaded",
+            })
+        except Exception as exc:  # noqa: BLE001
+            manifest.append({"name": original, "size": size, "status": "error", "error": str(exc)})
+
+    return jsonify(manifest)
 
 
-@app.route('/remove_watermark', methods=['GET'])
-def remove_watermark_route():
-    pdf_path = 'uploads/uploaded_file.pdf'
-    output_folder = 'output_images'
-    os.makedirs(output_folder, exist_ok=True)  # 创建输出目录（如果不存在）
-    image_paths = pdf_to_images(pdf_path, output_folder)
-    output_pdf_path = 'output_file.pdf'
-    images_to_pdf(image_paths, output_pdf_path)
-    return render_template('index.html', message='水印去除成功')
+@app.route("/process", methods=["POST"])
+def process():
+    data = request.get_json(silent=True) or {}
+    session_id = safe_id(data.get("session_id", ""))
+    file_id = safe_id(data.get("file_id", ""))
+    if not session_id or not file_id:
+        return jsonify({"error": "参数无效"}), 400
+
+    result = process_one(session_id, file_id)
+
+    # 记录原始文件名，供下载时还原命名
+    if result.get("status") == "done":
+        original = data.get("name") or f"{file_id}.pdf"
+        meta_path = os.path.join(OUT_DIR, session_id, f"{file_id}.pdf.meta.json")
+        try:
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump({"name": original}, fh, ensure_ascii=False)
+        except OSError as exc:  # noqa: BLE001
+            print(f"[warn] 写 meta.json 失败 {meta_path}: {exc}（下载名将回退为 {file_id}.pdf）")
+
+    return jsonify(result)
 
 
-@app.route('/download')
+def _read_meta(out_folder, pdf_name):
+    """读取某个成品 PDF 的原始文件名，找不到则回退。结果剥离路径前缀，避免 Zip Slip。"""
+    fallback = os.path.splitext(pdf_name)[0] + ".pdf"
+    meta_path = os.path.join(out_folder, pdf_name + ".meta.json")
+    name = fallback
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                name = json.load(fh).get("name", fallback)
+        except Exception:  # noqa: BLE001
+            name = fallback
+    return os.path.basename(name) or fallback
+
+
+@app.route("/download")
 def download():
-    output_pdf_path = 'output_file.pdf'
-    return send_file(output_pdf_path, as_attachment=True)
+    session_id = safe_id(request.args.get("session", ""))
+    if not session_id:
+        abort(400, "无效的 session")
+
+    out_folder = os.path.join(OUT_DIR, session_id)
+    if not os.path.isdir(out_folder):
+        abort(404, "没有可下载的结果")
+
+    pdfs = sorted(n for n in os.listdir(out_folder) if n.endswith(".pdf"))
+    if not pdfs:
+        abort(404, "没有可下载的结果")
+
+    # 指定 file_id：下载单个文件的纯净版（供队列里「下载纯净版」）
+    file_id = safe_id(request.args.get("file", ""))
+    if file_id:
+        target = file_id + ".pdf"
+        path = os.path.join(out_folder, target)
+        if not os.path.isfile(path):
+            abort(404, "文件不存在")
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=_read_meta(out_folder, target),
+        )
+
+    if len(pdfs) == 1:
+        return send_file(
+            os.path.join(out_folder, pdfs[0]),
+            as_attachment=True,
+            download_name=_read_meta(out_folder, pdfs[0]),
+        )
+
+    zip_path = zip_session(session_id)
+
+    @after_this_request
+    def _remove_zip(response):
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        zip_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"去水印结果_{session_id[:8]}.zip",
+    )
 
 
-if __name__ == '__main__':
+@app.route("/cleanup", methods=["POST"])
+def cleanup():
+    data = request.get_json(silent=True) or {}
+    session_id = safe_id(data.get("session_id", ""))
+    if session_id:
+        cleanup_session(session_id)
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
     app.run(debug=True)

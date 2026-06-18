@@ -1,2 +1,4 @@
 output_images/
+uploads/
+outputs/
 __pycache__/
