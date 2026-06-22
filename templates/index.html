@@ -114,6 +114,36 @@
         .dz-sub { color: var(--text-faint); font-size: 0.84rem; margin-top: 5px; }
         .dz-pickers { margin-top: 14px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 
+        /* 去水印方式选择 */
+        .mode-row {
+            margin-top: 16px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            flex-wrap: wrap;
+            padding: 12px 14px;
+            background: var(--card-2);
+            border: 1px solid var(--border-soft);
+            border-radius: var(--radius-sm);
+        }
+        .mode-label { font-weight: 700; color: var(--title); font-size: 0.9rem; }
+        .mode-opt {
+            display: inline-flex; align-items: center; gap: 6px;
+            font-size: 0.86rem; color: var(--text);
+            cursor: pointer;
+        }
+        .mode-opt input { accent-color: var(--primary); width: 15px; height: 15px; }
+        .keyword-input {
+            flex: 1; min-width: 180px;
+            font: inherit; font-size: 0.9rem;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            background: var(--card);
+        }
+        .keyword-input:focus { outline: 2px solid var(--primary); outline-offset: 0; border-color: var(--primary); }
+
         /* 提示 + 主按钮 行 */
         .notice {
             margin-top: 16px;
@@ -266,6 +296,35 @@
             border-radius: 7px;
         }
         .op-btn:hover { border-color: var(--primary); color: var(--primary); }
+
+        /* 多方式状态（每文件可分别用文本/所有水印处理） */
+        .mode-line { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .mode-line:last-child { margin-bottom: 0; }
+        .mode-tag {
+            font-size: 0.72rem; font-weight: 700; color: var(--text-muted);
+            background: var(--card-2); border: 1px solid var(--border);
+            padding: 2px 7px; border-radius: 5px; white-space: nowrap; min-width: 52px; text-align: center;
+        }
+        .ops { flex-wrap: wrap; }
+
+        /* 手动框选工作区 */
+        .picker {
+            margin-top: 18px;
+            padding: 16px;
+            background: var(--card-2);
+            border: 1px solid var(--border-soft);
+            border-radius: var(--radius-sm);
+        }
+        .picker-head { margin-bottom: 10px; }
+        .picker-head strong { color: var(--title); }
+        .picker-sub { display: block; color: var(--text-muted); font-size: 0.84rem; margin-top: 4px; }
+        .picker-stage {
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 8px; padding: 10px; text-align: center;
+            max-height: 520px; overflow: auto;
+        }
+        #pickerCanvas { max-width: 100%; cursor: crosshair; display: inline-block; }
+        .picker-actions { margin-top: 12px; display: flex; gap: 10px; justify-content: flex-end; }
         .remove-x {
             background: transparent;
             border: none;
@@ -361,6 +420,14 @@
                 </div>
             </div>
 
+            <div class="mode-row">
+                <span class="mode-label">去水印方式</span>
+                <label class="mode-opt"><input type="radio" name="wm-mode" value="all" checked><span>所有水印（强力去灰，保彩色底）</span></label>
+                <label class="mode-opt"><input type="radio" name="wm-mode" value="text"><span>文本水印（OCR精准，保格子）</span></label>
+                <label class="mode-opt"><input type="radio" name="wm-mode" value="manual"><span>手动框选（最彻底，框一处水印）</span></label>
+                <input type="text" id="keywordInput" class="keyword-input" value="温老师教育" placeholder="输入水印文字，如：温老师教育" aria-label="水印文字">
+            </div>
+
             <div class="notice">
                 <div class="notice-body">
                     <div class="notice-title">💡 即时精简模式已激活</div>
@@ -395,6 +462,21 @@
             <div class="bar-all" id="barAll">
                 <a href="#" class="dl-all" id="dlAll">⬇ 全部下载 (zip)</a>
             </div>
+
+            <!-- 手动框选工作区 -->
+            <div class="picker" id="picker" hidden>
+                <div class="picker-head">
+                    <strong>框选水印样本</strong>
+                    <span class="picker-sub" id="pickerSub">先点上方文件的「框选水印」加载预览，然后在图上拖出一个框，框住一处「温老师教育」水印（彩色底上的也行）</span>
+                </div>
+                <div class="picker-stage">
+                    <canvas id="pickerCanvas" aria-label="水印样本框选预览"></canvas>
+                </div>
+                <div class="picker-actions">
+                    <button type="button" class="btn-ghost" id="pickerClear">重新框选</button>
+                    <button type="button" class="btn-primary" id="pickerConfirm" disabled>用此样本处理该文件</button>
+                </div>
+            </div>
         </section>
 
         <footer>
@@ -423,6 +505,11 @@
             barAll: document.getElementById('barAll'),
             dlAll: document.getElementById('dlAll'),
             a11yStatus: document.getElementById('a11yStatus'),
+            picker: document.getElementById('picker'),
+            pickerCanvas: document.getElementById('pickerCanvas'),
+            pickerSub: document.getElementById('pickerSub'),
+            pickerClear: document.getElementById('pickerClear'),
+            pickerConfirm: document.getElementById('pickerConfirm'),
         };
 
         let sessionId = null;
@@ -450,11 +537,28 @@
         }
         const isPdf = (f) => f.name.toLowerCase().endsWith('.pdf');
 
+        const MODES = [
+            { key: 'text', label: '文本水印' },
+            { key: 'all', label: '所有水印' },
+        ];
+        const ALL_MODES = [...MODES, { key: 'manual', label: '手动框选' }];
+        const currentMode = () => {
+            const el = document.querySelector('input[name="wm-mode"]:checked');
+            return el ? el.value : 'all';
+        };
+        // 某文件某方式的处理状态
+        const modeStatus = (item, mode) => {
+            if (item.processing === mode) return 'processing';
+            const r = item.results[mode];
+            return r ? r.status : 'pending';
+        };
+
         function addFiles(fileList) {
             let added = 0;
             for (const f of fileList) {
                 if (!isPdf(f)) continue;
-                queue.push({ key: uid(), name: f.name, size: f.size, file: f, status: 'queued' });
+                queue.push({ key: uid(), name: f.name, size: f.size, file: f, id: null,
+                             results: { text: null, all: null }, processing: null });
                 added++;
             }
             render();
@@ -467,15 +571,12 @@
             render();
         }
 
-        // 重置某项为 queued（用于「重试」/「重做」），清掉服务端 id 让其重新走上传+处理
-        function resetItem(key) {
+        // 重置某文件某方式的结果，使其可重新处理（不影响另一方式）
+        function resetMode(key, mode) {
             if (processing) return;
             const item = queue.find(q => q.key === key);
             if (!item) return;
-            item.status = 'queued';
-            item.id = null;
-            item.pages = null;
-            item.elapsed = null;
+            item.results[mode] = null;
             render();
         }
 
@@ -539,193 +640,305 @@
         function renderStatus(item) {
             const wrap = document.createElement('div');
             wrap.className = 'status';
-            const txt = document.createElement('span');
-            txt.className = 'status-text';
-
-            switch (item.status) {
-                case 'processing': {
-                    const bar = document.createElement('div');
-                    bar.className = 'progress';
-                    bar.setAttribute('role', 'progressbar');
-                    bar.setAttribute('aria-label', item.name + ' 处理进度');
-                    bar.setAttribute('aria-busy', 'true');
-                    txt.className = 'status-text proc';
-                    txt.innerHTML = '<span class="spinner" aria-hidden="true"></span>处理中…';
-                    wrap.append(bar, txt);
-                    return wrap;
+            for (const m of ALL_MODES) {
+                const line = document.createElement('div');
+                line.className = 'mode-line';
+                const tag = document.createElement('span');
+                tag.className = 'mode-tag';
+                tag.textContent = m.label;
+                const badge = document.createElement('span');
+                const st = modeStatus(item, m.key);
+                if (st === 'processing') {
+                    badge.className = 'badge proc';
+                    badge.innerHTML = '<span class="spinner" aria-hidden="true"></span>处理中';
+                } else if (st === 'done') {
+                    badge.className = 'badge done';
+                    const r = item.results[m.key];
+                    badge.textContent = '✓ 完成' + (r && r.pages ? ' · ' + r.pages + '页' : '');
+                } else if (st === 'error') {
+                    badge.className = 'badge fail';
+                    badge.textContent = '失败';
+                } else {
+                    badge.className = 'badge queued';
+                    badge.textContent = '未处理';
                 }
-                case 'done': {
-                    txt.className = 'status-text done';
-                    const sec = item.elapsed ? (item.elapsed / 1000).toFixed(1) : null;
-                    txt.textContent = '✓ 处理完成' + (sec ? ' (耗时 ' + sec + ' 秒)' : '')
-                        + (item.pages ? ' · ' + item.pages + ' 页' : '');
-                    wrap.append(txt);
-                    return wrap;
-                }
-                case 'error': {
-                    txt.className = 'status-text fail';
-                    txt.textContent = '处理失败';
-                    wrap.append(txt);
-                    return wrap;
-                }
-                case 'rejected': {
-                    txt.className = 'status-text fail';
-                    txt.textContent = '已跳过';
-                    wrap.append(txt);
-                    return wrap;
-                }
-                case 'too_large': {
-                    txt.className = 'status-text fail';
-                    txt.textContent = '文件过大';
-                    wrap.append(txt);
-                    return wrap;
-                }
-                default: {
-                    txt.className = 'status-text wait';
-                    txt.textContent = '等待队列中';
-                    wrap.append(txt);
-                    return wrap;
-                }
+                line.append(tag, badge);
+                wrap.appendChild(line);
             }
+            return wrap;
         }
 
         function renderOps(item) {
             const wrap = document.createElement('div');
             wrap.className = 'ops';
-
-            if (item.status === 'done' && item.id && sessionId) {
-                const a = document.createElement('a');
-                a.className = 'dl';
-                a.href = '/download?session=' + encodeURIComponent(sessionId)
-                       + '&file=' + encodeURIComponent(item.id);
-                a.download = '';
-                a.textContent = '⬇ 下载纯净版';
-                wrap.appendChild(a);
-
-                if (!processing) {
-                    const redo = document.createElement('button');
-                    redo.className = 'op-btn';
-                    redo.type = 'button';
-                    redo.title = '重新处理';
-                    redo.setAttribute('aria-label', '重新处理 ' + item.name);
-                    redo.textContent = '↻ 重做';
-                    redo.onclick = () => resetItem(item.key);
-                    wrap.appendChild(redo);
+            // 下载：任一方式完成均可（后端按 mode 返回，文件名带方式后缀）
+            for (const m of ALL_MODES) {
+                if (modeStatus(item, m.key) === 'done' && item.id && sessionId) {
+                    const a = document.createElement('a');
+                    a.className = 'dl';
+                    a.href = '/download?session=' + encodeURIComponent(sessionId)
+                           + '&file=' + encodeURIComponent(item.id) + '&mode=' + m.key;
+                    a.download = '';
+                    a.textContent = '⬇ ' + m.label;
+                    wrap.appendChild(a);
                 }
             }
-
-            if ((item.status === 'error' || item.status === 'rejected') && !processing) {
-                const retry = document.createElement('button');
-                retry.className = 'op-btn';
-                retry.type = 'button';
-                retry.title = '重试';
-                retry.setAttribute('aria-label', '重试 ' + item.name);
-                retry.textContent = '↻ 重试';
-                retry.onclick = () => resetItem(item.key);
-                wrap.appendChild(retry);
-            }
-
-            if (item.status === 'queued' || item.status === 'error'
-                || item.status === 'rejected' || item.status === 'too_large') {
+            const cur = currentMode();
+            if (!processing) {
+                if (cur === 'manual') {
+                    const pick = document.createElement('button');
+                    pick.className = 'op-btn';
+                    pick.type = 'button';
+                    pick.textContent = '✂ 框选水印';
+                    pick.setAttribute('aria-label', '框选水印样本 ' + item.name);
+                    pick.onclick = () => openPicker(item);
+                    wrap.appendChild(pick);
+                } else if (cur !== 'manual' && modeStatus(item, cur) !== 'done' && item.processing !== cur) {
+                    const run = document.createElement('button');
+                    run.className = 'op-btn';
+                    run.type = 'button';
+                    run.textContent = '▶ 处理';
+                    run.setAttribute('aria-label', '处理 ' + item.name);
+                    run.onclick = () => processSingle(item.key);
+                    wrap.appendChild(run);
+                }
                 const rm = document.createElement('button');
-                rm.className = 'remove-x';
-                rm.type = 'button';
-                rm.title = '移除';
-                rm.setAttribute('aria-label', '移除 ' + item.name);
-                rm.textContent = '×';
-                if (!processing) rm.onclick = () => removeItem(item.key);
+                rm.className = 'remove-x'; rm.type = 'button'; rm.title = '移除';
+                rm.setAttribute('aria-label', '移除 ' + item.name); rm.textContent = '×';
+                rm.onclick = () => removeItem(item.key);
                 wrap.appendChild(rm);
             }
             return wrap;
         }
 
         function updateButtons() {
-            const hasQueued = queue.some(q => q.status === 'queued');
-            const doneCount = queue.filter(q => q.status === 'done').length;
-            els.processBtn.disabled = processing || !hasQueued;
-
-            if (doneCount >= 1 && sessionId) {
+            const cur = currentMode();
+            els.picker.hidden = (cur !== 'manual');
+            if (cur === 'manual') {
+                els.processBtn.disabled = true;
+                els.processBtn.textContent = '✂ 手动模式：点文件的「框选水印」';
+                if (!pickerItem) els.pickerSub.textContent = '点上方某个文件的「框选水印」按钮加载预览，再框选一处水印';
+            } else {
+                els.processBtn.disabled = processing || queue.length === 0;
+                const ml = cur === 'text' ? '文本水印' : '所有水印';
+                els.processBtn.textContent = '⚡ 用「' + ml + '」处理';
+            }
+            // 全部下载：任一文件任一方式 done 即可（zip 含所有产物）
+            const totalDone = queue.reduce((s, q) =>
+                s + ALL_MODES.filter(m => q.results[m.key] && q.results[m.key].status === 'done').length, 0);
+            if (totalDone >= 1 && sessionId) {
                 els.barAll.classList.add('show');
                 els.dlAll.href = '/download?session=' + encodeURIComponent(sessionId);
-                els.dlAll.textContent = doneCount > 1
-                    ? '⬇ 全部下载 (' + doneCount + ' 个 zip)'
-                    : '⬇ 全部下载';
+                els.dlAll.textContent = '⬇ 全部下载 (' + totalDone + ' 份 zip)';
             } else {
                 els.barAll.classList.remove('show');
             }
         }
 
-        async function startProcess() {
-            const targets = queue.filter(q => q.status === 'queued');
-            if (!targets.length || processing) return;
+        function getModeAndKeyword() {
+            const mode = currentMode();
+            const keyword = (document.getElementById('keywordInput').value || '').trim();
+            return { mode, keyword };
+        }
 
+        // 处理一组文件（批量与单文件共用）
+        async function processTargets(targets, mode, keyword) {
+            if (!targets.length) return;
             processing = true;
             if (!sessionId) sessionId = uuid();
 
-            // 上传全部待处理文件
-            targets.forEach(q => { q.status = 'processing'; q.startedAt = performance.now(); });
-            render();
-
-            const form = new FormData();
-            form.append('session_id', sessionId);
-            targets.forEach(q => form.append('file', q.file, q.name));
-
-            let manifest;
-            try {
-                const res = await fetch('/upload', { method: 'POST', body: form });
-                manifest = await res.json();
-                if (!res.ok || !Array.isArray(manifest)) throw new Error(manifest.error || '上传失败');
-            } catch (err) {
-                targets.forEach(q => { q.status = 'error'; });
-                processing = false;
-                render();
-                flashTip('上传失败：' + err.message, true);
-                return;
+            const toUpload = targets.filter(q => !q.id);
+            if (toUpload.length) {
+                const form = new FormData();
+                form.append('session_id', sessionId);
+                toUpload.forEach(q => form.append('file', q.file, q.name));
+                try {
+                    const res = await fetch('/upload', { method: 'POST', body: form });
+                    const manifest = await res.json();
+                    if (!res.ok || !Array.isArray(manifest)) throw new Error(manifest.error || '上传失败');
+                    toUpload.forEach((q, i) => { q.id = manifest[i].id; });
+                } catch (err) {
+                    toUpload.forEach(q => { q.results[mode] = { status: 'error' }; });
+                    processing = false;
+                    render();
+                    flashTip('上传失败：' + err.message, true);
+                    return;
+                }
             }
 
-            // 按 manifest 顺序回填服务端 id 与状态
-            targets.forEach((q, i) => {
-                const m = manifest[i] || {};
-                q.id = m.id;
-                if (m.status === 'uploaded') q.status = 'queued';
-                else if (m.status === 'too_large') q.status = 'too_large';
-                else if (m.status === 'rejected') q.status = 'rejected';
-                else q.status = 'error';
-            });
-            render();
-
-            // 顺序逐个处理（一个文件一次请求 = 天然逐文件进度）
             for (const q of targets) {
-                if (q.status !== 'queued') continue;
-                q.status = 'processing';
-                q.startedAt = performance.now();
+                if (!q.id) continue;
+                q.processing = mode;
+                const startedAt = performance.now();
                 render();
                 try {
                     const res = await fetch('/process', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ session_id: sessionId, file_id: q.id, name: q.name }),
+                        body: JSON.stringify({ session_id: sessionId, file_id: q.id, name: q.name, mode: mode, keyword: keyword }),
                     });
                     const data = await res.json();
-                    q.elapsed = performance.now() - q.startedAt;
-                    if (res.ok && data.status === 'done') {
-                        q.status = 'done';
-                        q.pages = data.pages;
-                    } else {
-                        q.status = 'error';
-                    }
+                    const elapsed = performance.now() - startedAt;
+                    q.results[mode] = (res.ok && data.status === 'done')
+                        ? { status: 'done', pages: data.pages, elapsed }
+                        : { status: 'error', elapsed };
                 } catch (err) {
-                    q.elapsed = performance.now() - q.startedAt;
-                    q.status = 'error';
+                    q.results[mode] = { status: 'error' };
                 }
+                q.processing = null;
                 render();
             }
 
             processing = false;
-            const done = targets.filter(q => q.status === 'done').length;
-            const failed = targets.length - done;
-            flashTip(failed === 0 ? '全部完成，点「下载纯净版」即可' : ('完成 ' + done + ' 个，' + failed + ' 个未成功'), failed > 0);
+            const done = targets.filter(q => q.results[mode] && q.results[mode].status === 'done').length;
+            flashTip(done === targets.length
+                ? '处理完成，点对应方式的下载即可'
+                : ('完成 ' + done + '/' + targets.length + '，失败的可重新处理'), done < targets.length);
             updateButtons();
+        }
+
+        // 批量处理：当前方式未完成的所有文件
+        async function startProcess() {
+            if (processing) return;
+            const { mode, keyword } = getModeAndKeyword();
+            if (mode === 'text' && !keyword) { flashTip('文本水印模式请先输入水印文字', true); return; }
+            const targets = queue.filter(q => modeStatus(q, mode) !== 'done');
+            if (!targets.length) { flashTip('当前方式已全部处理完，可切换另一种方式再处理', false); return; }
+            await processTargets(targets, mode, keyword);
+        }
+
+        // 单文件处理：只处理指定的某一个（不必批量）
+        async function processSingle(key) {
+            if (processing) return;
+            const { mode, keyword } = getModeAndKeyword();
+            if (mode === 'text' && !keyword) { flashTip('文本水印模式请先输入水印文字', true); return; }
+            const item = queue.find(q => q.key === key);
+            if (!item || modeStatus(item, mode) === 'done') return;
+            await processTargets([item], mode, keyword);
+        }
+
+        // ===== 手动框选模式 =====
+        let pickerItem = null, pickerImg = null, pickerRect = null, pickerDrawing = false;
+
+        async function openPicker(item) {
+            if (processing) return;
+            if (!sessionId) sessionId = uuid();
+            pickerItem = item;
+            pickerRect = null;
+            pickerImg = null;
+            els.pickerConfirm.disabled = true;
+            els.picker.hidden = false;
+            els.picker.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            // 若文件未上传，先上传（框选预览需要文件在服务器）
+            if (!item.id) {
+                els.pickerSub.textContent = '上传文件中…';
+                const form = new FormData();
+                form.append('session_id', sessionId);
+                form.append('file', item.file, item.name);
+                try {
+                    const res = await fetch('/upload', { method: 'POST', body: form });
+                    const m = await res.json();
+                    if (!res.ok || !Array.isArray(m)) throw new Error(m.error || '上传失败');
+                    item.id = m[0].id;
+                } catch (e) {
+                    flashTip('上传失败：' + e.message, true);
+                    pickerItem = null;
+                    return;
+                }
+            }
+            els.pickerSub.textContent = '加载预览中…';
+            const img = new Image();
+            img.onload = () => {
+                pickerImg = img;
+                const c = els.pickerCanvas;
+                c.width = img.naturalWidth; c.height = img.naturalHeight;
+                drawPicker();
+                els.pickerSub.textContent = '在图上拖出一个框，框住一处「温老师教育」水印（彩色底上的也行、倾斜的也行）';
+            };
+            img.onerror = () => { els.pickerSub.textContent = '预览加载失败，请重试'; };
+            img.src = '/preview?session=' + encodeURIComponent(sessionId)
+                    + '&file=' + encodeURIComponent(item.id);
+        }
+
+        function drawPicker() {
+            if (!pickerImg) return;
+            const c = els.pickerCanvas, ctx = c.getContext('2d');
+            ctx.drawImage(pickerImg, 0, 0);
+            if (pickerRect) {
+                const x = Math.min(pickerRect.x0, pickerRect.x1), y = Math.min(pickerRect.y0, pickerRect.y1);
+                const w = Math.abs(pickerRect.x1 - pickerRect.x0), h = Math.abs(pickerRect.y1 - pickerRect.y0);
+                ctx.strokeStyle = '#2a5297';
+                ctx.lineWidth = Math.max(2, Math.round(c.width / 400));
+                ctx.setLineDash([8, 5]);
+                ctx.strokeRect(x, y, w, h);
+                ctx.setLineDash([]);
+            }
+        }
+
+        function pickerPos(e) {
+            const c = els.pickerCanvas, r = c.getBoundingClientRect();
+            return { x: (e.clientX - r.left) * (c.width / r.width),
+                     y: (e.clientY - r.top) * (c.height / r.height) };
+        }
+
+        els.pickerCanvas.addEventListener('mousedown', (e) => {
+            if (!pickerImg) return;
+            pickerDrawing = true;
+            const p = pickerPos(e);
+            pickerRect = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+            drawPicker();
+        });
+        els.pickerCanvas.addEventListener('mousemove', (e) => {
+            if (!pickerDrawing) return;
+            const p = pickerPos(e);
+            pickerRect.x1 = p.x; pickerRect.y1 = p.y;
+            drawPicker();
+        });
+        window.addEventListener('mouseup', () => {
+            if (!pickerDrawing) return;
+            pickerDrawing = false;
+            if (pickerRect) {
+                const w = Math.abs(pickerRect.x1 - pickerRect.x0), h = Math.abs(pickerRect.y1 - pickerRect.y0);
+                els.pickerConfirm.disabled = (w < 20 || h < 20);
+            }
+        });
+        els.pickerClear.onclick = () => { pickerRect = null; drawPicker(); els.pickerConfirm.disabled = true; };
+        els.pickerConfirm.onclick = processPicker;
+
+        async function processPicker() {
+            if (!pickerItem || !pickerRect || processing) return;
+            const w = Math.abs(pickerRect.x1 - pickerRect.x0), h = Math.abs(pickerRect.y1 - pickerRect.y0);
+            if (w < 20 || h < 20) return;
+            // 裁剪框选区域为模板
+            const tmp = document.createElement('canvas');
+            tmp.width = w; tmp.height = h;
+            tmp.getContext('2d').drawImage(pickerImg,
+                Math.min(pickerRect.x0, pickerRect.x1), Math.min(pickerRect.y0, pickerRect.y1), w, h,
+                0, 0, w, h);
+            const blob = await new Promise(r => tmp.toBlob(r, 'image/png'));
+            processing = true;
+            if (!sessionId) sessionId = uuid();
+            pickerItem.processing = 'manual';
+            render();
+            const form = new FormData();
+            form.append('session_id', sessionId);
+            form.append('file_id', pickerItem.id);
+            form.append('name', pickerItem.name);
+            form.append('template', blob, 'template.png');
+            try {
+                const res = await fetch('/process_manual', { method: 'POST', body: form });
+                const data = await res.json();
+                pickerItem.results.manual = (res.ok && data.status === 'done')
+                    ? { status: 'done', pages: data.pages } : { status: 'error' };
+            } catch (err) {
+                pickerItem.results.manual = { status: 'error' };
+            }
+            pickerItem.processing = null;
+            processing = false;
+            render();
+            flashTip(pickerItem.results.manual.status === 'done'
+                ? '手动框选处理完成，点「⬇ 手动框选」下载'
+                : '处理失败，可调整框选重试', pickerItem.results.manual.status !== 'done');
         }
 
         // 事件绑定
@@ -754,6 +967,10 @@
         });
 
         els.processBtn.onclick = startProcess;
+
+        // 切换去水印方式时刷新主按钮文案
+        document.querySelectorAll('input[name="wm-mode"]').forEach(r =>
+            r.addEventListener('change', render));
 
         // 不在 beforeunload 清理服务端文件——刷新页面也会触发它，会误删刚处理好的结果。
         // 服务端临时目录改由 app.py 的 startup_cleanup（按 24h mtime）兜底回收。

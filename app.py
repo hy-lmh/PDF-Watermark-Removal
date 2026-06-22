@@ -12,7 +12,7 @@ import fitz
 from fpdf import FPDF
 from PIL import Image
 from flask import (Flask, render_template, request, send_file, jsonify, abort,
-                   after_this_request)
+                   after_this_request, Response)
 
 # --- 配置 ---
 UPLOAD_DIR = "uploads"          # 用户上传的原始 PDF（按会话隔离）
@@ -39,22 +39,168 @@ def safe_id(value):
 
 
 def remove_watermark(image_path):
-    """就地去除单张图片的水印（针对灰/暗色水印）。单页异常不中断整批。"""
+    """强力去除灰色水印（含极淡/倾斜排布），仅保护彩色底色。
+
+    灰水印与灰格子线颜色相同、无法用颜色区分；本方案优先保证去水印干净，
+    故灰格子线会一并去除，而彩色底色（绿/蓝/粉/橙/紫等任意色，饱和度高）完整保留。
+    单页异常不中断整批。
+    """
     try:
         img = cv2.imread(image_path)
         if img is None:
             return
-        lower = np.array([160, 160, 160])
-        upper = np.array([255, 255, 255])
-        mask = cv2.inRange(img, lower, upper)
-        mask = cv2.GaussianBlur(mask, (1, 1), 0)
-        img[mask == 255] = [255, 255, 255]
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        S = hsv[:, :, 1]
+        # 1) 灰水印候选：S≤20（纯灰）+ V≥160（偏亮，含极淡水印）
+        cand = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([180, 20, 255]))
+        # 2) 保护任意彩色底色：附近 7px 内有饱和度>35 的彩色 → 排除
+        S_dil = cv2.dilate(S, np.ones((7, 7), np.uint8))
+        cand[S_dil > 35] = 0
+        img[cand > 0] = [255, 255, 255]
         cv2.imwrite(image_path, img)
     except Exception as exc:  # noqa: BLE001 - 单页失败不应中断整批
         print(f"[warn] 去水印失败 {image_path}: {exc}")
 
 
-def pdf_to_images(pdf_path, output_folder):
+_ocr_engine = None
+
+
+def get_ocr():
+    """懒加载 OCR 引擎（模块级单例，避免每页重复加载模型）。"""
+    global _ocr_engine
+    if _ocr_engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _ocr_engine = RapidOCR()
+    return _ocr_engine
+
+
+def _is_watermark_text(text, keyword):
+    """判断 OCR 文字是否属于水印：与关键词字符重合度高、且文字不长（排除正文长句）。"""
+    text = (text or "").strip()
+    keyword = keyword.strip()
+    if not text or not keyword:
+        return False
+    common = sum(1 for c in set(keyword) if c in text)
+    overlap = common / len(set(keyword))
+    # 水印就是这几个字（含部分识别），正文是长句 → 用长度卡掉正文
+    return overlap >= 0.5 and len(text) <= len(keyword) + 3
+
+
+def remove_text_watermark(image_path, keyword):
+    """OCR 定位关键词水印框，仅在框内去除灰色水印像素。
+
+    框内用较宽的灰色阈值（覆盖水印与底色叠加后淡化的部分，避免残留"绿字"），
+    但保留框内饱和度高的彩色底（如题型标题绿底）与黑色正文。
+    框外的格子、底纹、正文完全不碰。
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return 0
+    try:
+        result, _ = get_ocr()(img)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] OCR 失败 {image_path}: {exc}")
+        return 0
+    if not result:
+        return 0
+
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    S, V = hsv[:, :, 1], hsv[:, :, 2]
+    # 灰水印像素：低饱和 + 偏亮。框内用宽阈值 S≤55（题型标题绿底 S≈66 仍能保住）
+    gray_wm = (S <= 55) & (V >= 150) & (V < 253)
+
+    box_mask = np.zeros((h, w), dtype=np.uint8)
+    count = 0
+    for box, text, score in result:
+        if not _is_watermark_text(text, keyword):
+            continue
+        try:
+            conf = float(score)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf < 0.5:
+            continue
+        cv2.fillPoly(box_mask, [np.array(box, dtype=np.int32)], 255)
+        count += 1
+
+    if count == 0:
+        return 0
+    # 仅轻微膨胀盖住文字笔画边缘，不向外扩张（避免碰到题型标题等彩色底）
+    box_mask = cv2.dilate(box_mask, np.ones((3, 3), np.uint8), iterations=1)
+    final = (box_mask == 255) & gray_wm
+    img[final] = [255, 255, 255]
+    cv2.imwrite(image_path, img)
+    return count
+
+
+def manual_remove(image_path, template):
+    """用框选的水印样本做模板，多角度匹配定位后 inpaint 修复。
+
+    能去除压在彩色底上的水印：inpaint 用周围彩色底色填充水印区域，底色不损。
+    返回匹配到的水印框数量。
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return 0
+    H, W = img.shape[:2]
+    th, tw = template.shape[:2]
+    if th >= H or tw >= W:
+        return 0
+    mask = np.zeros((H, W), dtype=np.uint8)
+    count = 0
+    # 多角度匹配（覆盖水平 + 倾斜水印）
+    for ang in (0, -45, -60, 45, 30, -30, -15, 15):
+        M = cv2.getRotationMatrix2D((tw / 2, th / 2), ang, 1.0)
+        rot = cv2.warpAffine(template, M, (tw, th), borderValue=(255, 255, 255))
+        if rot.shape[0] >= H or rot.shape[1] >= W:
+            continue
+        res = cv2.matchTemplate(img, rot, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(res >= 0.55)
+        for y, x in zip(ys, xs):
+            cv2.rectangle(mask, (x, y), (x + tw, y + th), 255, -1)
+            count += 1
+    if mask.any():
+        out = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
+        cv2.imwrite(image_path, out)
+    return count
+
+
+def process_one_manual(session_id, file_id, template_path):
+    """手动框选模式：用样本模板多角度匹配全文档水印并 inpaint 去除。"""
+    pdf_path = os.path.join(UPLOAD_DIR, session_id, f"{file_id}.pdf")
+    img_folder = os.path.join(IMG_DIR, session_id, file_id)
+    out_path = os.path.join(OUT_DIR, session_id, f"{file_id}_manual.pdf")
+    if not os.path.exists(pdf_path):
+        return {"id": file_id, "mode": "manual", "pages": 0, "status": "missing"}
+    template = cv2.imread(template_path)
+    if template is None:
+        return {"id": file_id, "mode": "manual", "status": "error", "error": "模板读取失败"}
+
+    os.makedirs(img_folder, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    images = []
+    try:
+        doc = fitz.open(pdf_path)
+        dpi = 150  # 手动框选模式用 150dpi，与预览一致、匹配更快
+        for i in range(doc.page_count):
+            page = doc[i]
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
+            ip = os.path.join(img_folder, f"page_{i + 1}.png")
+            pix.save(ip)
+            images.append(ip)
+            manual_remove(ip, template)
+        doc.close()
+        images_to_pdf(images, out_path)
+        return {"id": file_id, "mode": "manual", "pages": len(images), "status": "done"}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[error] 手动处理失败 {file_id}: {exc}")
+        return {"id": file_id, "mode": "manual", "status": "error", "error": str(exc)}
+    finally:
+        shutil.rmtree(img_folder, ignore_errors=True)
+
+
+def pdf_to_images(pdf_path, output_folder, remove_fn=None):
     """把 PDF 每页渲染成 PNG 并去水印，返回图片路径列表。"""
     os.makedirs(output_folder, exist_ok=True)
     images = []
@@ -66,7 +212,8 @@ def pdf_to_images(pdf_path, output_folder):
             image_path = os.path.join(output_folder, f"page_{page_num + 1}.png")
             pix.save(image_path)
             images.append(image_path)
-            remove_watermark(image_path)
+            if remove_fn:
+                remove_fn(image_path)
     finally:
         doc.close()
     return images
@@ -84,20 +231,31 @@ def images_to_pdf(image_paths, output_path):
     pdf.output(output_path)
 
 
-def process_one(session_id, file_id):
-    """处理单个已上传文件：转图 → 去水印 → 合回 PDF，返回结果字典。"""
+def process_one(session_id, file_id, mode="all", keyword=""):
+    """处理单个已上传文件：转图 → 去水印 → 合回 PDF，返回结果字典。
+
+    mode: "text" = OCR 精准定位关键词水印（保留格子/底纹/正文）；
+          "all"  = HSV 通用去灰水印（快，但会误伤灰格子/漏彩色）。
+    """
     pdf_path = os.path.join(UPLOAD_DIR, session_id, f"{file_id}.pdf")
     img_folder = os.path.join(IMG_DIR, session_id, file_id)
-    out_path = os.path.join(OUT_DIR, session_id, f"{file_id}.pdf")
+    out_path = os.path.join(OUT_DIR, session_id, f"{file_id}_{mode}.pdf")
 
     if not os.path.exists(pdf_path):
         return {"id": file_id, "pages": 0, "status": "missing"}
 
+    # 按模式选去除函数：text 用 OCR 精准定位，all 用 HSV 通用去灰
+    if mode == "text" and keyword.strip():
+        kw = keyword.strip()
+        remove_fn = lambda p: remove_text_watermark(p, kw)
+    else:
+        remove_fn = remove_watermark
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     try:
-        images = pdf_to_images(pdf_path, img_folder)
+        images = pdf_to_images(pdf_path, img_folder, remove_fn)
         images_to_pdf(images, out_path)
-        return {"id": file_id, "pages": len(images), "status": "done"}
+        return {"id": file_id, "mode": mode, "pages": len(images), "status": "done"}
     except Exception as exc:  # noqa: BLE001
         print(f"[error] 处理失败 {file_id}: {exc}")
         return {"id": file_id, "pages": 0, "status": "error", "error": str(exc)}
@@ -221,17 +379,22 @@ def process():
     if not session_id or not file_id:
         return jsonify({"error": "参数无效"}), 400
 
-    result = process_one(session_id, file_id)
+    mode = data.get("mode") or "all"
+    keyword = (data.get("keyword") or "").strip()
+    result = process_one(session_id, file_id, mode=mode, keyword=keyword)
 
-    # 记录原始文件名，供下载时还原命名
+    # 记录原始文件名（带方式后缀），供下载时还原命名
     if result.get("status") == "done":
         original = data.get("name") or f"{file_id}.pdf"
-        meta_path = os.path.join(OUT_DIR, session_id, f"{file_id}.pdf.meta.json")
+        base = os.path.splitext(original)[0]
+        suffix = "文本水印" if mode == "text" else "所有水印"
+        dl_name = f"{base}_{suffix}.pdf"
+        meta_path = os.path.join(OUT_DIR, session_id, f"{file_id}_{mode}.pdf.meta.json")
         try:
             with open(meta_path, "w", encoding="utf-8") as fh:
-                json.dump({"name": original}, fh, ensure_ascii=False)
+                json.dump({"name": dl_name}, fh, ensure_ascii=False)
         except OSError as exc:  # noqa: BLE001
-            print(f"[warn] 写 meta.json 失败 {meta_path}: {exc}（下载名将回退为 {file_id}.pdf）")
+            print(f"[warn] 写 meta.json 失败 {meta_path}: {exc}（下载名将回退为 {file_id}_{mode}.pdf）")
 
     return jsonify(result)
 
@@ -264,10 +427,13 @@ def download():
     if not pdfs:
         abort(404, "没有可下载的结果")
 
-    # 指定 file_id：下载单个文件的纯净版（供队列里「下载纯净版」）
+    # 指定 file_id + mode：下载某个去水印方式的纯净版
     file_id = safe_id(request.args.get("file", ""))
+    mode = request.args.get("mode", "all")
+    if mode not in ("all", "text", "manual"):
+        mode = "all"
     if file_id:
-        target = file_id + ".pdf"
+        target = f"{file_id}_{mode}.pdf"
         path = os.path.join(out_folder, target)
         if not os.path.isfile(path):
             abort(404, "文件不存在")
@@ -300,6 +466,59 @@ def download():
         as_attachment=True,
         download_name=f"去水印结果_{session_id[:8]}.zip",
     )
+
+
+@app.route("/preview")
+def preview():
+    """渲染某页为 PNG 预览，供前端框选水印样本。"""
+    session_id = safe_id(request.args.get("session", ""))
+    file_id = safe_id(request.args.get("file", ""))
+    page = request.args.get("page", "1")
+    try:
+        page = max(1, int(page))
+    except ValueError:
+        page = 1
+    if not session_id or not file_id:
+        abort(400, "参数无效")
+    pdf_path = os.path.join(UPLOAD_DIR, session_id, f"{file_id}.pdf")
+    if not os.path.isfile(pdf_path):
+        abort(404, "文件不存在")
+    doc = fitz.open(pdf_path)
+    try:
+        idx = min(page - 1, doc.page_count - 1)
+        pix = doc[idx].get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72))
+        data = pix.tobytes("png")
+    finally:
+        doc.close()
+    return Response(data, mimetype="image/png")
+
+
+@app.route("/process_manual", methods=["POST"])
+def process_manual():
+    """手动框选模式：接收模板图，多角度匹配全文档水印并 inpaint 去除。"""
+    session_id = safe_id(request.form.get("session_id", ""))
+    file_id = safe_id(request.form.get("file_id", ""))
+    name = request.form.get("name") or f"{file_id}.pdf"
+    if not session_id or not file_id:
+        return jsonify({"error": "参数无效"}), 400
+    tf = request.files.get("template")
+    if not tf:
+        return jsonify({"error": "请先框选水印样本"}), 400
+    tpl_dir = os.path.join(UPLOAD_DIR, session_id)
+    os.makedirs(tpl_dir, exist_ok=True)
+    tpl_path = os.path.join(tpl_dir, f"{file_id}_template.png")
+    tf.save(tpl_path)
+    result = process_one_manual(session_id, file_id, tpl_path)
+    if result.get("status") == "done":
+        base = os.path.splitext(name)[0]
+        dl_name = f"{base}_手动框选.pdf"
+        meta_path = os.path.join(OUT_DIR, session_id, f"{file_id}_manual.pdf.meta.json")
+        try:
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump({"name": dl_name}, fh, ensure_ascii=False)
+        except OSError as exc:  # noqa: BLE001
+            print(f"[warn] 写 meta.json 失败 {meta_path}: {exc}")
+    return jsonify(result)
 
 
 @app.route("/cleanup", methods=["POST"])
