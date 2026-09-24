@@ -1,0 +1,15 @@
+services:
+  pdf-watermark:
+    build: .
+    container_name: pdf-watermark
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 数据落在宿主机 ./data，容器重建不丢；24h 自动清理也在这个目录里生效
+      - ./data:/data
+    # 内存给足：300dpi 渲染 + 图像处理峰值约 1~1.5GB
+    deploy:
+      resources:
+        limits:
+          memory: 2G
